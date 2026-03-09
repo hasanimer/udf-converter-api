@@ -15,9 +15,10 @@ logger = logging.getLogger(__name__)
 def home():
     return jsonify({
         'status': 'UDF Converter API',
-        'version': '1.0',
+        'version': '2.0',
         'endpoints': {
-            '/convert': 'POST - UDF dosyası dönüştürme'
+            '/convert': 'POST - UDF → PDF/DOCX',
+            '/convert-to-udf': 'POST - DOCX/PDF → UDF',
         }
     })
 
@@ -27,6 +28,7 @@ def health():
 
 @app.route('/convert', methods=['POST'])
 def convert():
+    """UDF → PDF/DOCX dönüştürme"""
     try:
         if 'file' not in request.files:
             logger.error('Dosya bulunamadı')
@@ -95,6 +97,83 @@ def convert():
     
     except subprocess.TimeoutExpired:
         return jsonify({'error': 'Dönüştürme zaman aşımına uğradı'}), 504
+    except Exception as e:
+        logger.error(f'Beklenmeyen hata: {str(e)}')
+        return jsonify({'error': 'Sunucu hatası', 'details': str(e)}), 500
+
+@app.route('/convert-to-udf', methods=['POST'])
+def convert_to_udf():
+    """DOCX/PDF → UDF dönüştürme"""
+    try:
+        if 'file' not in request.files:
+            logger.error('Dosya bulunamadı')
+            return jsonify({'error': 'Dosya bulunamadı'}), 400
+        
+        file = request.files['file']
+        
+        if not file.filename:
+            return jsonify({'error': 'Dosya adı geçersiz'}), 400
+        
+        # Dosya tipini belirle
+        file_ext = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else ''
+        
+        if file_ext == 'docx':
+            script = 'docx_to_udf.py'
+            input_suffix = '.docx'
+            mime_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        elif file_ext == 'pdf':
+            script = 'scanned_pdf_to_udf.py'
+            input_suffix = '.pdf'
+            mime_type = 'application/pdf'
+        else:
+            return jsonify({'error': 'Geçersiz dosya tipi (docx veya pdf olmalı)'}), 400
+        
+        logger.info(f'UDF dönüştürme başlıyor: {file.filename} -> UDF')
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=input_suffix) as tmp:
+            file.save(tmp.name)
+            input_path = tmp.name
+        
+        result = subprocess.run(
+            ['python3', script, input_path],
+            capture_output=True,
+            text=True,
+            timeout=60  # PDF → UDF daha uzun sürebilir
+        )
+        
+        if result.returncode != 0:
+            logger.error(f'Script hatası: {result.stderr}')
+            return jsonify({'error': 'Dönüştürme başarısız', 'details': result.stderr}), 500
+        
+        output_path = input_path.replace(input_suffix, '.udf')
+        
+        if not os.path.exists(output_path):
+            logger.error('UDF dosyası oluşturulamadı')
+            return jsonify({'error': 'UDF dosyası oluşturulamadı'}), 500
+        
+        logger.info(f'UDF dönüştürme başarılı: {output_path}')
+        
+        response = send_file(
+            output_path,
+            mimetype='application/zip',  # UDF is essentially a ZIP
+            as_attachment=True,
+            download_name='converted.udf'
+        )
+        
+        @response.call_on_close
+        def cleanup():
+            try:
+                if os.path.exists(input_path):
+                    os.remove(input_path)
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+            except Exception as e:
+                logger.error(f'Temizlik hatası: {e}')
+        
+        return response
+    
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'Dönüştürme zaman aşımına uğradı (60 saniye)'}), 504
     except Exception as e:
         logger.error(f'Beklenmeyen hata: {str(e)}')
         return jsonify({'error': 'Sunucu hatası', 'details': str(e)}), 500
